@@ -4,7 +4,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { createMockwire, VERSION } = require('./server.js');
 
-const BOOL = new Set(['json', 'quiet', 'drop', 'timeout', 'passthrough', 'disabled', 'last', 'insecure', 'no-cors', 'offline', 'help', 'version', 'force', 'tail-all']);
+const BOOL = new Set(['json', 'quiet', 'drop', 'timeout', 'passthrough', 'disabled', 'last', 'insecure', 'no-cors', 'offline', 'help', 'version', 'force', 'tail-all', 'public', 'no-trust-proxy']);
 
 function parseArgs(argv) {
   const pos = [];
@@ -31,9 +31,12 @@ const HELP = `mockwire ${VERSION} - HTTP mock / fault-injection proxy (AI-friend
 Server:
   mockwire start [--upstream URL | --upstream name=URL]... [--port 8899] [--host 0.0.0.0]
                  [--config mockwire.json] [--scenario NAME] [--offline] [--no-cors] [--insecure] [--quiet]
+  mockwire serve --token T [--upstream ...] [--default-upstream dev] [--host 127.0.0.1] [--session-ttl 1440]
+                                     hosted mode (behind HTTPS reverse proxy): token required, trusts X-Forwarded-*
   mockwire init                      write example mockwire.json in cwd
 
-Control a running instance (all support --json; target via --url http://127.0.0.1:8899, --port N or MOCKWIRE_URL):
+Control a running instance (all support --json; target via --url https://host, --port N or MOCKWIRE_URL;
+  --token T or MOCKWIRE_TOKEN for hosted; --session NAME or MOCKWIRE_SESSION to act on one isolated session):
   mockwire state
   mockwire rule add [--name N] [--method GET] [--path /api/x] [--query k=v] [--header k=v] [--body-contains S] [--host H]
                     ACTION: --status 500 [--body-json '{}'|--body-text S|--body-file F] [--resp-header k=v]
@@ -44,6 +47,8 @@ Control a running instance (all support --json; target via --url http://127.0.0.
   mockwire rule list | rule rm <id|name> | rule enable|disable <id|name> | rule clear
   mockwire offline on|off|status
   mockwire scenario list | scenario use <name>
+  mockwire upstream list|use <name|default>   (per session)
+  mockwire session list | session rm <name>
   mockwire log [--tail 20] [--clear]
   mockwire reset                     clear runtime rules, offline off, log cleared, scenario reset
   mockwire health
@@ -75,16 +80,18 @@ async function main(argv) {
 
   try {
     const cmd = pos[0];
-    if (cmd === 'start') return await start(flags, json, die);
+    if (cmd === 'start' || cmd === 'serve') return await start(flags, json, die, cmd === 'serve');
     if (cmd === 'init') return init(out, die);
 
     const base = (one(flags, 'url') || process.env.MOCKWIRE_URL || `http://127.0.0.1:${one(flags, 'port') || process.env.MOCKWIRE_PORT || 8899}`).replace(/\/$/, '');
+    const tokenArg = one(flags, 'token') || process.env.MOCKWIRE_TOKEN;
+    const session = one(flags, 'session') || process.env.MOCKWIRE_SESSION;
     async function api(method, p, body) {
       let res;
       try {
-        res = await fetch(`${base}/__mockwire${p}`, {
+        res = await fetch(`${base}${session ? '/s/' + encodeURIComponent(session) : ''}/__mockwire${p}`, {
           method,
-          headers: body !== undefined ? { 'content-type': 'application/json' } : {},
+          headers: { ...(body !== undefined ? { 'content-type': 'application/json' } : {}), ...(tokenArg ? { authorization: `Bearer ${tokenArg}` } : {}) },
           body: body !== undefined ? JSON.stringify(body) : undefined,
         });
       } catch (e) {
@@ -104,6 +111,24 @@ async function main(argv) {
       case 'state': {
         const d = await api('GET', '/state');
         return out(d, human_state(d));
+      }
+      case 'upstream': {
+        if (rest[0] === 'use') {
+          if (!rest[1]) return die('usage: mockwire upstream use <name|default> [--session S]');
+          const d = await api('PUT', '/upstream', { name: rest[1] === 'default' ? null : rest[1] });
+          return out(d, `upstream: ${d.upstream || 'default'}`);
+        }
+        const d = await api('GET', '/upstream');
+        return out(d, `active: ${d.upstream || '(default)'}\n` + d.available.map((u) => `  ${u.name || '(default)'} ${u.url}`).join('\n'));
+      }
+      case 'session': {
+        if (rest[0] === 'rm') {
+          if (!rest[1]) return die('usage: mockwire session rm <name>');
+          const d = await api('DELETE', `/sessions/${encodeURIComponent(rest[1])}`);
+          return out(d, d.removed ? 'removed' : 'no such session');
+        }
+        const d = await api('GET', '/sessions');
+        return out(d, d.sessions.map((x) => `${x.name} rules=${x.rules} offline=${x.offline} upstream=${x.upstream || '-'} requests=${x.requests} idle=${x.idleSeconds}s`).join('\n') || '(none)');
       }
       case 'reset': {
         const d = await api('POST', '/reset');
@@ -169,7 +194,7 @@ async function main(argv) {
 
 function human_state(d) {
   return [
-    `mockwire ${d.version}  offline=${d.offline ? 'ON' : 'off'}  scenario=${d.scenario || 'default'}  requests=${d.requests}`,
+    `mockwire ${d.version}  session=${d.session}  upstream=${d.upstream || 'default'}  offline=${d.offline ? 'ON' : 'off'}  scenario=${d.scenario || 'default'}  requests=${d.requests}`,
     `upstreams: ${d.upstreams.map((u) => (u.name ? u.name + '=' : '') + u.url).join(', ') || '(none)'}`,
     d.configPath ? `config: ${d.configPath}${d.configError ? '  ERROR: ' + d.configError : ''}` : 'config: (none)',
     `rules (${d.rules.length}):`,
@@ -266,10 +291,20 @@ function init(out, die) {
   out({ created: f }, `created ${f}`);
 }
 
-async function start(flags, json, die) {
+async function start(flags, json, die, serve) {
   let mw;
+  const token = one(flags, 'token') || process.env.MOCKWIRE_TOKEN;
+  const hostFlag = one(flags, 'host');
+  const loopback = (h) => h === 'localhost' || h === '::1' || /^127\./.test(h);
+  if ((serve || one(flags, 'public')) && !token) return die('serve/--public requires --token <secret> (or env MOCKWIRE_TOKEN)');
+  if (hostFlag && !loopback(hostFlag) && !token) return die(`--host ${hostFlag} is not loopback: --token (or MOCKWIRE_TOKEN) is required`);
   try {
     mw = createMockwire({
+      token,
+      requireToken: !!(serve || one(flags, 'public')),
+      defaultUpstream: one(flags, 'default-upstream'),
+      sessionTtlMinutes: one(flags, 'session-ttl') !== undefined ? Number(one(flags, 'session-ttl')) : undefined,
+      trustProxy: !one(flags, 'no-trust-proxy'),
       upstreams: many(flags, 'upstream'),
       config: one(flags, 'config'),
       scenario: one(flags, 'scenario'),
@@ -277,7 +312,7 @@ async function start(flags, json, die) {
       cors: !one(flags, 'no-cors'),
       insecure: !!one(flags, 'insecure'),
       port: one(flags, 'port') !== undefined ? Number(one(flags, 'port')) : undefined,
-      host: one(flags, 'host'),
+      host: hostFlag || (serve ? '127.0.0.1' : undefined),
       logger: one(flags, 'quiet') ? null : (l) => console.log(json ? JSON.stringify({ event: 'request', line: l }) : l),
     });
   } catch (e) {
@@ -300,7 +335,8 @@ async function start(flags, json, die) {
     console.log(`  ios sim / web / desktop:  http://localhost:${port}`);
     console.log(`  android emulator:         http://10.0.2.2:${port}`);
     for (const i of lan) console.log(`  real device (LAN):        http://${i}:${port}`);
-    console.log(`  control:   http://localhost:${port}/__mockwire/state   (CLI: mockwire state)`);
+    console.log(`  control:   http://localhost:${port}/__mockwire/state   (CLI: mockwire state)${token ? '  [token required]' : '  [local only; use --token for remote]'}`);
+    console.log(`  sessions:  <base>/s/<name>/...  isolates rules/offline/log per name`);
     console.log(`  config:    ${S.configPath ? S.configPath + ' (hot reload)' : '(none)'}${S.scenario ? '  scenario=' + S.scenario : ''}`);
   }
   process.on('uncaughtException', (e) => console.error('mockwire: uncaught', e.message));

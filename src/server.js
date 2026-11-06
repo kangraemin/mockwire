@@ -5,6 +5,7 @@ const net = require('node:net');
 const fs = require('node:fs');
 const path = require('node:path');
 const zlib = require('node:zlib');
+const crypto = require('node:crypto');
 const { pipeline } = require('node:stream');
 const { ValidationError, normalizeRule, applyModify } = require('./rules.js');
 
@@ -13,7 +14,7 @@ const HOP = ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorizat
 const MAX_BODY = 20 * 1024 * 1024;
 const LOG_MAX = 500;
 const CONTROL = '/__mockwire';
-const CONFIG_KEYS = ['$schema', 'upstream', 'upstreams', 'port', 'scenario', 'rules', 'scenarios'];
+const CONFIG_KEYS = ['$schema', 'upstream', 'upstreams', 'defaultUpstream', 'port', 'scenario', 'rules', 'scenarios'];
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
@@ -88,21 +89,23 @@ function createMockwire(options = {}) {
   const cors = options.cors !== false;
   const S = {
     upstreams: [],
-    offline: !!options.offline,
-    scenario: null,
+    defaultUpstream: options.defaultUpstream || null,
     initialScenario: options.scenario || null,
     scenarios: {},
-    baseRules: [],
-    scenarioRules: [],
-    runtimeRules: [],
-    log: [],
-    seq: 0,
+    cfgBase: [],
+    cfgScenario: null,
+    sessions: new Map(),
     ruleSeq: 0,
     configPath: null,
     configDir: process.cwd(),
     configError: null,
     configPort: null,
   };
+  const token = options.token || process.env.MOCKWIRE_TOKEN || null;
+  const trustProxy = options.trustProxy !== false;
+  const sessionTtlMs = (options.sessionTtlMinutes ?? 1440) * 60000;
+  const MAX_SESSIONS = options.maxSessions || 500;
+  const SESSION_RE = /^[A-Za-z0-9_.-]{1,40}$/;
 
   // ---------- rules ----------
   function mkRule(input, source, baseDir) {
@@ -118,14 +121,54 @@ function createMockwire(options = {}) {
       remaining: r.spec.times ? Math.max(0, r.spec.times - r.hits) : null,
     };
   }
-  const allRules = () => [...S.runtimeRules, ...S.scenarioRules, ...S.baseRules];
-  function findRule(key) {
-    return allRules().find((r) => r.id === key || r.spec.name === key);
+  const allRules = (X) => [...X.runtimeRules, ...X.scenarioRules, ...X.baseRules];
+  function findRule(X, key) {
+    return allRules(X).find((r) => r.id === key || r.spec.name === key);
   }
-  function rebuildScenarioRules() {
-    const sc = S.scenario && S.scenarios[S.scenario];
-    S.scenarioRules = sc ? sc.rules.map((r) => mkRule(r, 'scenario')) : [];
+  function rebuildScenarioRules(X) {
+    const sc = X.scenario && S.scenarios[X.scenario];
+    X.scenarioRules = sc ? sc.rules.map((r) => mkRule(r, 'scenario')) : [];
   }
+  function rebuildBaseRules(X) {
+    X.baseRules = S.cfgBase.map((r) => mkRule(r, 'base'));
+  }
+  function validScenario(n) {
+    return n && (n === 'default' || S.scenarios[n]) ? n : null;
+  }
+
+  // ---------- sessions ----------
+  function getSession(name) {
+    let X = S.sessions.get(name);
+    if (!X) {
+      if (S.sessions.size >= MAX_SESSIONS) {
+        // evict least recently used non-default session
+        let oldest = null;
+        for (const x of S.sessions.values()) if (x.name !== 'default' && (!oldest || x.last < oldest.last)) oldest = x;
+        if (oldest) S.sessions.delete(oldest.name);
+      }
+      X = { name, runtimeRules: [], scenarioRules: [], baseRules: [], scenario: validScenario(S.initialScenario || S.cfgScenario), offline: name === 'default' && !!options.offline, log: [], seq: 0, upstream: null, created: Date.now(), last: Date.now() };
+      rebuildBaseRules(X);
+      rebuildScenarioRules(X);
+      S.sessions.set(name, X);
+    }
+    X.last = Date.now();
+    return X;
+  }
+  function resetSession(X) {
+    X.runtimeRules = [];
+    X.offline = X.name === 'default' && !!options.offline;
+    X.log = [];
+    X.upstream = null;
+    X.scenario = validScenario(S.initialScenario || S.cfgScenario);
+    rebuildBaseRules(X);
+    rebuildScenarioRules(X);
+  }
+  function sweep() {
+    const now = Date.now();
+    for (const [n, x] of S.sessions) if (n !== 'default' && now - x.last > sessionTtlMs) S.sessions.delete(n);
+  }
+  const sweeper = setInterval(sweep, Math.min(30000, Math.max(1000, sessionTtlMs / 2)));
+  sweeper.unref();
 
   // ---------- config ----------
   function parseConfig(text, baseDir) {
@@ -166,10 +209,13 @@ function createMockwire(options = {}) {
 
   function applyConfig(parsed, first) {
     S.scenarios = parsed.scenarios;
-    S.baseRules = parsed.base.map((r) => mkRule(r, 'base'));
-    const want = first ? S.initialScenario || parsed.cfg.scenario : S.scenario;
-    S.scenario = want && (want === 'default' || S.scenarios[want]) ? want : parsed.cfg.scenario || null;
-    rebuildScenarioRules();
+    S.cfgBase = parsed.base;
+    S.cfgScenario = parsed.cfg.scenario || null;
+    for (const X of S.sessions.values()) {
+      rebuildBaseRules(X);
+      if (!validScenario(X.scenario)) X.scenario = validScenario(S.initialScenario || S.cfgScenario);
+      rebuildScenarioRules(X);
+    }
     S.configError = null;
     if (first) {
       const ups = [];
@@ -177,6 +223,7 @@ function createMockwire(options = {}) {
       for (const [n, u] of Object.entries(parsed.cfg.upstreams || {})) ups.push(`${n}=${u}`);
       S.configUpstreams = ups;
       S.configPort = parsed.cfg.port ?? null;
+      if (!S.defaultUpstream) S.defaultUpstream = parsed.cfg.defaultUpstream || null;
     }
   }
 
@@ -228,13 +275,15 @@ function createMockwire(options = {}) {
 
   // ---------- logging ----------
   const ts = () => new Date().toTimeString().slice(0, 8);
-  function record(e) {
-    e.id = ++S.seq;
-    S.log.push(e);
-    if (S.log.length > LOG_MAX) S.log.shift();
+  function record(X, e) {
+    e.id = ++X.seq;
+    e.session = X.name;
+    X.log.push(e);
+    if (X.log.length > LOG_MAX) X.log.shift();
     if (logger) {
       const rule = e.rule ? ` rule=${e.rule}` : '';
-      logger(`${ts()} ${e.method} ${e.url} -> ${e.status ?? e.outcome} ${e.action} ${e.ms}ms${rule}${e.error ? ' err=' + e.error : ''}`);
+      const sess = X.name === 'default' ? '' : ` [${X.name}]`;
+      logger(`${ts()}${sess} ${e.method} ${e.url} -> ${e.status ?? e.outcome} ${e.action} ${e.ms}ms${rule}${e.error ? ' err=' + e.error : ''}`);
     }
   }
 
@@ -257,14 +306,15 @@ function createMockwire(options = {}) {
   }
 
   // ---------- upstream selection ----------
-  function pickUpstream(pathname) {
+  function pickUpstream(X, pathname) {
     for (const u of S.upstreams) {
       if (u.name && (pathname === '/' + u.name || pathname.startsWith('/' + u.name + '/'))) {
         return { up: u, path: pathname.slice(u.name.length + 1) || '/' };
       }
     }
-    const def = S.upstreams.find((u) => !u.name);
-    return def ? { up: def, path: pathname } : { up: null, path: pathname };
+    const want = X.upstream || S.defaultUpstream;
+    const def = (want && S.upstreams.find((u) => u.name === want)) || S.upstreams.find((u) => !u.name) || S.upstreams[0];
+    return { up: def || null, path: pathname };
   }
 
   function upstreamUrl(up, p, search) {
@@ -388,11 +438,27 @@ function createMockwire(options = {}) {
       res.writeHead(400);
       return res.end('bad request');
     }
+    // session: /s/<name>/... prefix or X-Mockwire-Session header
+    let sname = null;
+    if (!isForward) {
+      const sm = /^\/s\/([^/]+)(\/.*)?$/.exec(url.pathname);
+      if (sm) {
+        sname = sm[1];
+        url.pathname = sm[2] || '/';
+      }
+    }
+    if (!sname && req.headers['x-mockwire-session']) sname = String(req.headers['x-mockwire-session']);
+    delete req.headers['x-mockwire-session'];
+    if (sname && !SESSION_RE.test(sname)) {
+      return sendJson(req, res, 400, { error: { code: 'invalid_session', message: 'session name must match [A-Za-z0-9_.-]{1,40}' } });
+    }
+    const X = getSession(sname || 'default');
     if (!isForward && (url.pathname === CONTROL || url.pathname.startsWith(CONTROL + '/'))) {
-      return control(req, res, url);
+      return control(req, res, url, X);
     }
 
     const entry = {
+      client: clientIp(req),
       time: new Date().toISOString(),
       method: req.method,
       url: url.pathname + url.search,
@@ -409,7 +475,7 @@ function createMockwire(options = {}) {
       if (finished) return;
       finished = true;
       entry.ms = Date.now() - t0;
-      record(entry);
+      record(X, entry);
     };
     res.once('close', () => {
       if (!finished && entry.outcome === 'ok' && !res.writableFinished) entry.outcome = 'client_aborted';
@@ -417,7 +483,7 @@ function createMockwire(options = {}) {
     });
 
     try {
-      if (S.offline) {
+      if (X.offline) {
         entry.action = 'offline';
         entry.outcome = 'dropped';
         req.socket.destroy();
@@ -446,7 +512,7 @@ function createMockwire(options = {}) {
       if (isForward) {
         target = url;
       } else {
-        const { up, path: p } = pickUpstream(url.pathname);
+        const { up, path: p } = pickUpstream(X, url.pathname);
         pathname = p;
         if (up) {
           upName = up.name;
@@ -455,7 +521,7 @@ function createMockwire(options = {}) {
         }
       }
 
-      const rules = allRules();
+      const rules = allRules(X);
       const needBody = rules.some((r) => r.spec.enabled && r.spec.bodyContains !== undefined);
       let bodyBuf = null;
       if (needBody) bodyBuf = await readBody(req);
@@ -531,7 +597,25 @@ function createMockwire(options = {}) {
   }
 
   // ---------- control API ----------
-  async function control(req, res, url) {
+  function isLocal(req) {
+    const a = req.socket.remoteAddress || '';
+    const loop = a === '::1' || a.startsWith('127.') || a === '::ffff:127.0.0.1';
+    return loop && !req.headers['x-forwarded-for'] && !req.headers.forwarded;
+  }
+  function clientIp(req) {
+    const xff = trustProxy && req.headers['x-forwarded-for'];
+    return xff ? String(xff).split(',')[0].trim() : req.socket.remoteAddress;
+  }
+  function authorized(req) {
+    if (!token) return isLocal(req);
+    const h = req.headers.authorization || '';
+    const given = h.startsWith('Bearer ') ? h.slice(7) : req.headers['x-mockwire-token'] || '';
+    const a = Buffer.from(String(given));
+    const b = Buffer.from(token);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  }
+
+  async function control(req, res, url, X) {
     const p = url.pathname.slice(CONTROL.length).replace(/\/$/, '') || '/';
     const m = req.method;
     const fail = (status, code, message) => sendJson(req, res, status, { error: { code, message } });
@@ -539,6 +623,10 @@ function createMockwire(options = {}) {
       if (m === 'OPTIONS') {
         res.writeHead(204, corsHeaders(req, { 'access-control-allow-origin': req.headers.origin || '*', 'access-control-allow-methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS', 'access-control-allow-headers': '*', 'content-length': 0 }));
         return res.end();
+      }
+      if (url.pathname.replace(/\/$/, '') !== CONTROL + '/health' && !authorized(req)) {
+        res.setHeader('www-authenticate', 'Bearer realm="mockwire"');
+        return fail(401, 'unauthorized', token ? 'missing or wrong token (Authorization: Bearer <token>)' : 'control API is local-only; start with --token (or MOCKWIRE_TOKEN) to allow remote control');
       }
       let body;
       if (m === 'POST' || m === 'PUT' || m === 'PATCH') {
@@ -558,22 +646,24 @@ function createMockwire(options = {}) {
       if (p === '/state' && m === 'GET') {
         return ok({
           version: VERSION,
-          offline: S.offline,
-          scenario: S.scenario,
+          session: X.name,
+          upstream: (pickUpstream(X, '/').up || {}).name || null,
+          offline: X.offline,
+          scenario: X.scenario,
           scenarios: Object.keys(S.scenarios),
           upstreams: S.upstreams.map((u) => ({ name: u.name, url: u.url })),
           configPath: S.configPath,
           configError: S.configError,
-          requests: S.seq,
-          rules: allRules().map(publicRule),
+          requests: X.seq,
+          rules: allRules(X).map(publicRule),
         });
       }
 
       if (p === '/rules') {
-        if (m === 'GET') return ok({ rules: allRules().map(publicRule) });
+        if (m === 'GET') return ok({ rules: allRules(X).map(publicRule) });
         if (m === 'DELETE') {
-          const n = S.runtimeRules.length;
-          S.runtimeRules = [];
+          const n = X.runtimeRules.length;
+          X.runtimeRules = [];
           return ok({ removed: n });
         }
         if (m === 'POST') {
@@ -587,8 +677,8 @@ function createMockwire(options = {}) {
               throw new ValidationError(Array.isArray(body) ? `rules[${i}]: ${e.message}` : e.message);
             }
           });
-          if (url.searchParams.get('position') === 'last') S.runtimeRules.push(...made);
-          else S.runtimeRules.unshift(...made);
+          if (url.searchParams.get('position') === 'last') X.runtimeRules.push(...made);
+          else X.runtimeRules.unshift(...made);
           return ok(Array.isArray(body) ? { rules: made.map(publicRule) } : { rule: publicRule(made[0]) }, 201);
         }
       }
@@ -596,12 +686,12 @@ function createMockwire(options = {}) {
       let mm = /^\/rules\/([^/]+)$/.exec(p);
       if (mm) {
         const key = decodeURIComponent(mm[1]);
-        const r = findRule(key);
+        const r = findRule(X, key);
         if (!r) return fail(404, 'not_found', `no rule with id or name "${key}"`);
         if (m === 'GET') return ok({ rule: publicRule(r) });
         if (m === 'DELETE') {
           if (r.source !== 'runtime') return fail(400, 'not_runtime_rule', `rule "${key}" comes from the config file; edit the file or disable it with PATCH {"enabled":false}`);
-          S.runtimeRules = S.runtimeRules.filter((x) => x !== r);
+          X.runtimeRules = X.runtimeRules.filter((x) => x !== r);
           return ok({ removed: r.id });
         }
         if (m === 'PATCH') {
@@ -617,42 +707,64 @@ function createMockwire(options = {}) {
 
       mm = /^\/offline(?:\/(on|off))?$/.exec(p);
       if (mm) {
-        if (m === 'GET') return ok({ offline: S.offline });
+        if (m === 'GET') return ok({ offline: X.offline });
         if (m === 'PUT' || m === 'POST') {
           let on;
           if (mm[1]) on = mm[1] === 'on';
           else if (isObj(body) && typeof body.on === 'boolean') on = body.on;
           else return fail(400, 'validation_error', 'body must be {"on":true|false} (or use /offline/on, /offline/off)');
-          S.offline = on;
-          return ok({ offline: S.offline });
+          X.offline = on;
+          return ok({ offline: X.offline });
         }
       }
 
       if (p === '/reset' && m === 'POST') {
-        S.runtimeRules = [];
-        S.offline = false;
-        S.log = [];
-        S.scenario = S.initialScenario || null;
-        if (S.configPath) loadConfigFile(true);
-        else rebuildScenarioRules();
-        return ok({ ok: true, scenario: S.scenario });
+        resetSession(X);
+        return ok({ ok: true, session: X.name, scenario: X.scenario });
+      }
+
+      if (p === '/upstream') {
+        if (m === 'GET') return ok({ upstream: (pickUpstream(X, '/').up || {}).name || null, available: S.upstreams.map((u) => ({ name: u.name, url: u.url })) });
+        if (m === 'PUT' || m === 'POST') {
+          const name = body?.name;
+          if (name === null || name === 'default') {
+            X.upstream = null;
+          } else {
+            if (typeof name !== 'string' || !S.upstreams.some((u) => u.name === name)) {
+              return fail(400, 'validation_error', `body must be {"name":"<upstream>"|null}. available: ${S.upstreams.map((u) => u.name || '(default)').join(', ')}`);
+            }
+            X.upstream = name;
+          }
+          return ok({ upstream: (pickUpstream(X, '/').up || {}).name || null });
+        }
+      }
+
+      if (p === '/sessions' && m === 'GET') {
+        return ok({
+          sessions: [...S.sessions.values()].map((x) => ({ name: x.name, rules: x.runtimeRules.length, offline: x.offline, scenario: x.scenario, upstream: x.upstream, requests: x.seq, idleSeconds: Math.round((Date.now() - x.last) / 1000) })),
+        });
+      }
+      mm = /^\/sessions\/([^/]+)$/.exec(p);
+      if (mm && m === 'DELETE') {
+        if (mm[1] === 'default') return fail(400, 'validation_error', 'cannot delete the default session; use reset');
+        return ok({ removed: S.sessions.delete(mm[1]) });
       }
 
       if (p === '/log') {
         if (m === 'GET') {
           const tail = Number(url.searchParams.get('tail') || 50);
           const n = Number.isFinite(tail) && tail > 0 ? tail : 50;
-          return ok({ requests: S.log.slice(-n), total: S.seq });
+          return ok({ requests: X.log.slice(-n), total: X.seq });
         }
         if (m === 'DELETE') {
-          S.log = [];
+          X.log = [];
           return ok({ ok: true });
         }
       }
 
       if (p === '/scenarios' && m === 'GET') {
         return ok({
-          active: S.scenario,
+          active: X.scenario,
           scenarios: Object.entries(S.scenarios).map(([name, s]) => ({ name, description: s.description, rules: s.rules.length })),
         });
       }
@@ -664,9 +776,9 @@ function createMockwire(options = {}) {
         if (name !== 'default' && !S.scenarios[name]) {
           return fail(404, 'not_found', `unknown scenario "${name}". available: ${['default', ...Object.keys(S.scenarios)].join(', ')}`);
         }
-        S.scenario = name;
-        rebuildScenarioRules();
-        return ok({ scenario: S.scenario });
+        X.scenario = name;
+        rebuildScenarioRules(X);
+        return ok({ scenario: X.scenario });
       }
 
       return fail(404, 'not_found', `no such control endpoint: ${m} ${CONTROL}${p}`);
@@ -685,10 +797,11 @@ function createMockwire(options = {}) {
       if (fin) return;
       fin = true;
       entry.ms = Date.now() - t0;
-      record(entry);
+      record(X, entry);
     };
     socket.on('error', () => {});
-    if (S.offline) {
+    const X = getSession('default');
+    if (X.offline) {
       entry.action = 'offline';
       entry.outcome = 'dropped';
       socket.destroy();
@@ -736,9 +849,11 @@ function createMockwire(options = {}) {
 
   return {
     server,
+    sweep,
     state: S,
     listen(port = options.port ?? S.configPort ?? 8899, host = options.host || '0.0.0.0') {
       return new Promise((resolve, reject) => {
+        if (options.requireToken && !token) return reject(new ValidationError('serve mode requires --token (or env MOCKWIRE_TOKEN)'));
         server.once('error', reject);
         server.listen(port, host, () => {
           server.off('error', reject);
@@ -747,6 +862,7 @@ function createMockwire(options = {}) {
       });
     },
     close() {
+      clearInterval(sweeper);
       if (watching) fs.unwatchFile(S.configPath);
       return new Promise((resolve) => {
         server.close(() => resolve());
