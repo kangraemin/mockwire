@@ -1,0 +1,28 @@
+{
+  "$schema": "../schema/mockwire.config.schema.json",
+  "upstream": "https://runnershi-dev-api.oguriworks.com",
+  "port": 8899,
+  "rules": [],
+  "scenarios": {
+    "server_error": {
+      "description": "ranking API returns 500",
+      "rules": [{ "name": "ranking-500", "method": "GET", "path": "/api/ranking", "status": 500 }]
+    },
+    "empty": {
+      "description": "all GET list endpoints return []",
+      "rules": [{ "name": "empty-list", "method": "GET", "path": "/api/**", "json": [] }]
+    },
+    "slow": {
+      "description": "3s latency on everything",
+      "rules": [{ "name": "slow-all", "action": "passthrough", "delay": 3000 }]
+    },
+    "flaky": {
+      "description": "30% of requests lose the connection",
+      "rules": [{ "name": "flaky", "action": "drop", "probability": 0.3 }]
+    },
+    "terms_patched": {
+      "description": "real /api/terms, but first item's version bumped",
+      "rules": [{ "name": "terms-patch", "path": "/api/terms", "set": { "$.data[0].version": 99 } }]
+    }
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/kangraemin/mockwire/schema/mockwire.config.schema.json",
+  "title": "mockwire config (mockwire.json)",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "upstream": { "type": "string", "format": "uri", "description": "Default upstream, e.g. https://api.example.com[/base]" },
+    "upstreams": { "type": "object", "additionalProperties": { "type": "string", "format": "uri" }, "description": "Named upstreams, reachable at /<name>/..." },
+    "port": { "type": "integer", "minimum": 0, "maximum": 65535, "default": 8899 },
+    "scenario": { "type": "string", "description": "Initially active scenario name" },
+    "rules": { "type": "array", "items": { "$ref": "#/definitions/rule" }, "description": "Base rules, always active (evaluated after the active scenario's rules)" },
+    "scenarios": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "description": { "type": "string" },
+          "rules": { "type": "array", "items": { "$ref": "#/definitions/rule" } }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "matchValue": { "description": "exact string | \"re:<regex>\" | true (must exist)", "oneOf": [{ "type": "string" }, { "const": true }] },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "enabled": { "type": "boolean", "default": true },
+        "times": { "type": "integer", "minimum": 1, "description": "Apply N times, then the rule is skipped" },
+        "probability": { "type": "number", "minimum": 0, "maximum": 1 },
+
+        "method": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }], "description": "GET | [\"GET\",\"POST\"] | *" },
+        "path": { "type": "string", "description": "exact \"/a/b\" | glob \"/a/*\" \"/a/**\" | param \"/a/:id\" | regex \"re:^/a/\\d+$\"" },
+        "host": { "type": "string", "description": "Host header (reverse) / target host (forward proxy). glob or re:" },
+        "query": { "type": "object", "additionalProperties": { "$ref": "#/definitions/matchValue" } },
+        "header": { "type": "object", "additionalProperties": { "$ref": "#/definitions/matchValue" }, "description": "Request headers (case-insensitive names)" },
+        "bodyContains": { "type": "string" },
+        "upstream": { "type": "string", "description": "Only for requests routed to this named upstream" },
+
+        "action": { "enum": ["mock", "status", "delay", "drop", "timeout", "passthrough", "modify"], "description": "Inferred when omitted: json/text/file->mock, merge/set/remove->modify, status->status, delay->delay" },
+        "status": { "type": "integer", "minimum": 100, "maximum": 599 },
+        "headers": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Response headers" },
+        "json": { "description": "Response body as JSON (any JSON value)" },
+        "text": { "type": "string" },
+        "file": { "type": "string", "description": "Response body from file, relative to the config file" },
+        "delay": { "type": "number", "minimum": 0, "maximum": 3600000, "description": "ms to wait before acting; combine with any action" },
+        "merge": { "type": "object", "description": "modify: shallow-merge into the real JSON response" },
+        "set": { "type": "object", "description": "modify: {\"$.a.b[0].c\": value}" },
+        "remove": { "type": "array", "items": { "type": "string" }, "description": "modify: JSON paths to delete" }
+      }
+    }
+  }
+}
