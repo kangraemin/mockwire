@@ -81,3 +81,18 @@ Rule object in responses adds `id`, `source` (runtime|scenario|base), `hits`, `r
 - `modify` only patches JSON responses (content-type contains json); others pass through unchanged.
 - Cleartext: Android needs `usesCleartextTraffic` (debug) and iOS needs ATS exception for `http://` proxy URL. See README.
 - Control API is unauthenticated; use `--host 127.0.0.1` on shared networks.
+
+## 7. Hosted mode & sessions (real phones, remote testers, CI - not localhost-only)
+Run once on a server behind HTTPS (Caddy/nginx): `mockwire serve --token <secret> --upstream dev=https://dev-api.x.com --upstream prod=https://api.x.com --default-upstream dev` (binds 127.0.0.1 by default; `MOCKWIRE_TOKEN` env works too; `--session-ttl <minutes>` default 1440; `--no-trust-proxy`). `serve` refuses to start without a token. X-Forwarded-For is trusted for the client IP in logs.
+- Token: control API (`/__mockwire/*`, except `/health`) needs `Authorization: Bearer <token>` (or `X-Mockwire-Token`). Without a configured token, control only works from loopback (requests carrying X-Forwarded-For are rejected with 401). Proxy traffic itself needs no token.
+- Session = isolated rules / offline / log / scenario / upstream choice. Use it as a path prefix in the app's base URL: `https://mock.example.com/s/<session>` (works on every platform, no header injection). Alternative: header `X-Mockwire-Session: <session>`. Name: `[A-Za-z0-9_.-]{1,40}`. Unknown sessions are created on demand with no rules (pure passthrough) and deleted after the idle TTL. Requests without a session use `default`.
+- CLI: `--url https://mock.example.com --token <t> --session <name>` (or env MOCKWIRE_URL / MOCKWIRE_TOKEN / MOCKWIRE_SESSION). Every command accepts them.
+  `mockwire --session alice rule add --path /api/x --status 500`, `mockwire --session alice offline on`, `mockwire --session alice reset`.
+- Per-session upstream: `mockwire --session alice upstream use prod` (back: `upstream use default`); PUT `/__mockwire/upstream {"name":"prod"}`. Named upstreams are also reachable by path prefix: `/s/alice/prod/api/...`.
+- API: control URL = `<base>/s/<session>/__mockwire/...`; extra endpoints `GET /sessions`, `DELETE /sessions/:name`, `GET|PUT /upstream`. `state.session` / `log[].session` tell which session you are looking at.
+- Behind a reverse proxy `drop` / `offline` reach the client as 502 from the proxy (the proxy sees the reset), not as a TCP reset.
+
+### RunnersHi hosted instance
+- Base URL (app "서버 선택 > 직접 입력"): `https://runnershi-mock.oguriworks.com/s/<session>` - default upstream = dev API, per-session `upstream use prod` switches to prod.
+- CLI: `export MOCKWIRE_URL=https://runnershi-mock.oguriworks.com MOCKWIRE_TOKEN=$RUNNERSHI_MOCKWIRE_TOKEN` (token in ~/.claude/.env), then `npx github:kangraemin/mockwire --session <session> rule add ...`.
+- Use a unique session per agent/device (e.g. `ios-handnew`, `android-ci-123`); `reset` when done.

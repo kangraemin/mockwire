@@ -36,6 +36,31 @@ mockwire reset                                                        # 전부 �
 규칙 스키마, 제어 API, 우선순위는 [AGENTS.md](AGENTS.md), 설정 파일 스키마는 [schema/mockwire.config.schema.json](schema/mockwire.config.schema.json), 예제는 [examples/mockwire.json](examples/mockwire.json).
 핵심: 첫 매치가 이긴다. API/CLI로 추가한 규칙이 설정 파일 규칙보다 먼저, 그중에서도 나중에 추가한 게 먼저 적용된다(`--last`로 뒤에 추가).
 
+## 호스팅 모드 (localhost만이 아니라 실기기 / 외부 테스터 / CI)
+
+서버에 한 번 띄우고 HTTPS 리버스 프록시(Caddy 등) 뒤에 두면, 누구나 URL만 바꿔서 쓴다. 토큰 없이는 규칙 조작이 안 된다.
+
+```bash
+export MOCKWIRE_TOKEN=$(openssl rand -hex 24)
+mockwire serve --upstream dev=https://dev-api.example.com --upstream prod=https://api.example.com --default-upstream dev
+# 127.0.0.1:8899 에 뜬다. Caddy:  mock.example.com { reverse_proxy 127.0.0.1:8899 }
+```
+
+- `serve`는 토큰이 없으면 시작하지 않는다. 제어 API(`/__mockwire/*`)는 `Authorization: Bearer <token>`이 필요하다(토큰 없이 띄우면 로컬 접속만 허용, `X-Forwarded-For`가 붙은 요청은 401). 프록시 트래픽 자체에는 토큰이 필요 없다.
+- `X-Forwarded-For`를 신뢰해 로그에 실제 클라이언트 IP(`client`)를 남긴다.
+- **세션**: base URL에 `/s/<이름>`을 붙이면 그 이름의 규칙 / offline / 로그 / 시나리오 / 업스트림 선택이 다른 사람과 완전히 분리된다. 헤더 주입이 필요 없어서 모든 플랫폼에서 된다. 예) `https://mock.example.com/s/handnew`. 헤더 `X-Mockwire-Session`도 된다. 없는 세션은 규칙 없이 만들어지고(그대로 통과) 안 쓰면 TTL(기본 24시간) 뒤 지워진다.
+- CLI는 어디서나: `mockwire --url https://mock.example.com --token <t> --session handnew rule add --path /api/x --status 500` (환경변수 `MOCKWIRE_URL` / `MOCKWIRE_TOKEN` / `MOCKWIRE_SESSION`).
+- 세션별 업스트림: `mockwire --session handnew upstream use prod` (개발 서버가 기본, 이 세션만 상용으로).
+- Caddy 뒤에서는 `drop`/`offline`이 클라이언트에 TCP 끊김 대신 502로 보인다.
+
+**RunnersHi 호스팅 인스턴스**: base URL `https://runnershi-mock.oguriworks.com/s/<세션>` (기본 업스트림 = 개발 서버). 토큰은 `~/.claude/.env`의 `RUNNERSHI_MOCKWIRE_TOKEN`.
+
+```bash
+export MOCKWIRE_URL=https://runnershi-mock.oguriworks.com MOCKWIRE_TOKEN=$RUNNERSHI_MOCKWIRE_TOKEN
+npx github:kangraemin/mockwire --session ios-handnew rule add --path /api/ranking --status 500
+npx github:kangraemin/mockwire --session ios-handnew offline on
+```
+
 ## 플랫폼별 설정 (base URL을 프록시로)
 
 | 환경 | base URL |
@@ -43,6 +68,7 @@ mockwire reset                                                        # 전부 �
 | iOS 시뮬레이터 / 웹 / 데스크톱 | `http://localhost:8899` |
 | Android 에뮬레이터 | `http://10.0.2.2:8899` |
 | 실기기 (같은 Wi-Fi) | `http://<맥 LAN IP>:8899` (시작 시 출력됨) |
+| 어디서든 (호스팅, https) | `https://<호스트>/s/<세션>` - 위 호스팅 모드. https라 cleartext 설정이 필요 없다 |
 
 프록시는 `http://`라서 디버그 빌드에서만 평문 허용을 켠다.
 
